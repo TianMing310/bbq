@@ -1,0 +1,748 @@
+# tools/keysample_scannet_keysg.py
+import os
+import json
+import argparse
+import numpy as np
+import imageio.v2 as imageio
+from natsort import natsorted
+from tqdm import tqdm
+
+import open3d as o3d
+from shapely.geometry import Point, Polygon
+from shapely.prepared import prep
+
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+
+from skimage.filters import gaussian
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
+from scipy import ndimage as ndi
+
+
+# ---------------- IO helpers ----------------
+def load_intrinsics_txt_4x4(path):
+    K = np.loadtxt(path).astype(np.float32)
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    return fx, fy, cx, cy, K
+
+
+def list_scannet_files(scene_dir):
+    color_dir = os.path.join(scene_dir, "color")
+    depth_dir = os.path.join(scene_dir, "depth")
+    pose_dir  = os.path.join(scene_dir, "pose")
+
+    color_paths = natsorted([os.path.join(color_dir, f) for f in os.listdir(color_dir) if f.endswith(".jpg")])
+    depth_paths = natsorted([os.path.join(depth_dir, f) for f in os.listdir(depth_dir) if f.endswith(".png")])
+    pose_paths  = natsorted([os.path.join(pose_dir,  f) for f in os.listdir(pose_dir)  if f.endswith(".txt")])
+
+    if not (len(color_paths) == len(depth_paths) == len(pose_paths)):
+        raise ValueError(f"count mismatch color={len(color_paths)} depth={len(depth_paths)} pose={len(pose_paths)}")
+    return color_paths, depth_paths, pose_paths
+
+
+def load_pose_4x4(path, pose_is_w2c=False):
+    T = np.loadtxt(path).astype(np.float32)
+    if T.shape != (4, 4):
+        raise ValueError(f"pose not 4x4: {path} got {T.shape}")
+    if pose_is_w2c:
+        T = np.linalg.inv(T)
+    return T
+
+
+def rot_to_quat_wxyz(R):
+    """Robust quaternion (w,x,y,z) from rotation matrix."""
+    m = R
+    t = np.trace(m)
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    else:
+        if (m[0, 0] > m[1, 1]) and (m[0, 0] > m[2, 2]):
+            s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float32)
+    n = np.linalg.norm(q) + 1e-12
+    return q / n
+
+
+# ---------------- geometry helpers ----------------
+def backproject_depth_to_world(
+    depth_png_path, T_c2w,
+    fx, fy, cx, cy,
+    depth_scale=1000.0,
+    max_depth=4.0,
+    sample_px=8,
+    max_points=20000,
+):
+    depth = imageio.imread(depth_png_path)
+    if depth.ndim != 2:
+        raise ValueError(f"depth not HxW: {depth_png_path}")
+
+    depth_m = depth.astype(np.float32) / float(depth_scale)
+    H, W = depth_m.shape
+
+    us = np.arange(0, W, sample_px, dtype=np.int32)
+    vs = np.arange(0, H, sample_px, dtype=np.int32)
+    uu, vv = np.meshgrid(us, vs)
+    z = depth_m[vv, uu]
+
+    valid = (z > 0.1) & (z < max_depth)
+    if valid.sum() == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    uu = uu[valid].astype(np.float32)
+    vv = vv[valid].astype(np.float32)
+    z  = z[valid].astype(np.float32)
+
+    x = (uu - cx) / fx * z
+    y = (vv - cy) / fy * z
+    pts_cam = np.stack([x, y, z, np.ones_like(z)], axis=1)  # (N,4)
+
+    if pts_cam.shape[0] > max_points:
+        idx = np.random.choice(pts_cam.shape[0], size=max_points, replace=False)
+        pts_cam = pts_cam[idx]
+
+    pts_w = (T_c2w @ pts_cam.T).T[:, :3].astype(np.float32)
+    return pts_w
+
+
+def voxelize_points(points_xyz, voxel):
+    """points_xyz: (N,3) -> set(int64 packed voxel ids)"""
+    if points_xyz is None or points_xyz.shape[0] == 0:
+        return set()
+    v = np.floor(points_xyz / float(voxel)).astype(np.int64)
+    off = 1_000_000
+    base = 2_000_001
+    ix = v[:, 0] + off
+    iy = v[:, 1] + off
+    iz = v[:, 2] + off
+    ids = ix * (base * base) + iy * base + iz
+    return set(np.unique(ids).tolist())
+
+
+def polygon_contains_xy(prep_poly, xy):
+    inside = np.zeros((xy.shape[0],), dtype=bool)
+    for i in range(xy.shape[0]):
+        inside[i] = prep_poly.contains(Point(float(xy[i, 0]), float(xy[i, 1])))
+    return inside
+
+
+# ---------------- Room segmentation (KeySG III-A engineering) ----------------
+def segment_rooms_from_dense_cloud(points_xyz, bev_res=0.10, floor_band=(0.05, 0.20), smooth_sigma=1.0):
+    """
+    BEV occupancy -> gaussian -> watershed => regions
+    each region -> axis-aligned bbox polygon
+    Return list of rooms: {poly, bbox(minx,miny,maxx,maxy), z_range}
+    """
+    z = points_xyz[:, 2]
+    z_low = np.quantile(z, 0.30)
+    z_sel = z[z <= z_low]
+    hist, edges = np.histogram(z_sel, bins=200)
+    peak = int(np.argmax(hist))
+    floor_z = 0.5 * (edges[peak] + edges[peak + 1])
+
+    zmin = floor_z - float(floor_band[0])
+    zmax = floor_z + float(floor_band[1])
+    floor_pts = points_xyz[(z >= zmin) & (z <= zmax)]
+
+    if floor_pts.shape[0] < 500:
+        xy = points_xyz[:, :2]
+        minxy = xy.min(axis=0); maxxy = xy.max(axis=0)
+        poly = Polygon([(minxy[0], minxy[1]), (maxxy[0], minxy[1]), (maxxy[0], maxxy[1]), (minxy[0], maxxy[1])])
+        return [{
+            "poly": poly,
+            "bbox": (float(minxy[0]), float(minxy[1]), float(maxxy[0]), float(maxxy[1])),
+            "z_range": (float(points_xyz[:, 2].min()), float(points_xyz[:, 2].max()))
+        }]
+
+    xy = floor_pts[:, :2]
+    minxy = xy.min(axis=0); maxxy = xy.max(axis=0)
+    W = int(np.ceil((maxxy[0] - minxy[0]) / bev_res)) + 1
+    H = int(np.ceil((maxxy[1] - minxy[1]) / bev_res)) + 1
+
+    ix = np.clip(((xy[:, 0] - minxy[0]) / bev_res).astype(np.int32), 0, W - 1)
+    iy = np.clip(((xy[:, 1] - minxy[1]) / bev_res).astype(np.int32), 0, H - 1)
+
+    occ = np.zeros((H, W), dtype=np.float32)
+    np.add.at(occ, (iy, ix), 1.0)
+
+    occ_s = gaussian(occ, sigma=smooth_sigma)
+    mask = occ_s > 0.5
+
+    dist = ndi.distance_transform_edt(mask)
+    coords = peak_local_max(dist, footprint=np.ones((15, 15)), labels=mask)
+
+    markers = np.zeros_like(dist, dtype=np.int32)
+    for k, (r, c) in enumerate(coords, start=1):
+        markers[r, c] = k
+
+    if markers.max() == 0:
+        poly = Polygon([(minxy[0], minxy[1]), (maxxy[0], minxy[1]), (maxxy[0], maxxy[1]), (minxy[0], maxxy[1])])
+        return [{
+            "poly": poly,
+            "bbox": (float(minxy[0]), float(minxy[1]), float(maxxy[0]), float(maxxy[1])),
+            "z_range": (float(points_xyz[:, 2].min()), float(points_xyz[:, 2].max()))
+        }]
+
+    labels = watershed(-dist, markers, mask=mask)
+
+    rooms = []
+    for lab in range(1, labels.max() + 1):
+        region = (labels == lab)
+        if region.sum() < 200:
+            continue
+        ys, xs = np.where(region)
+        minx = xs.min() * bev_res + minxy[0]
+        maxx = (xs.max() + 1) * bev_res + minxy[0]
+        miny = ys.min() * bev_res + minxy[1]
+        maxy = (ys.max() + 1) * bev_res + minxy[1]
+
+        poly = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
+        bbox = (float(minx), float(miny), float(maxx), float(maxy))
+
+        x0, y0, x1, y1 = bbox
+        dense_xy = points_xyz[:, :2]
+        in_bbox = (dense_xy[:, 0] >= x0) & (dense_xy[:, 0] <= x1) & (dense_xy[:, 1] >= y0) & (dense_xy[:, 1] <= y1)
+        if in_bbox.sum() < 200:
+            zrg = (float(points_xyz[:, 2].min()), float(points_xyz[:, 2].max()))
+        else:
+            z_inside = points_xyz[in_bbox, 2]
+            zrg = (float(np.quantile(z_inside, 0.01)), float(np.quantile(z_inside, 0.99)))
+
+        rooms.append({"poly": poly, "bbox": bbox, "z_range": zrg})
+
+    if len(rooms) == 0:
+        xy_all = points_xyz[:, :2]
+        minxy = xy_all.min(axis=0); maxxy = xy_all.max(axis=0)
+        poly = Polygon([(minxy[0], minxy[1]), (maxxy[0], minxy[1]), (maxxy[0], maxxy[1]), (minxy[0], maxxy[1])])
+        rooms = [{
+            "poly": poly,
+            "bbox": (float(minxy[0]), float(minxy[1]), float(maxxy[0]), float(maxxy[1])),
+            "z_range": (float(points_xyz[:, 2].min()), float(points_xyz[:, 2].max()))
+        }]
+    return rooms
+
+
+def assign_room_by_volumetric(camera_center, rooms, z_margin=0.10):
+    x, y, z = float(camera_center[0]), float(camera_center[1]), float(camera_center[2])
+    pt = Point(x, y)
+    for rid, r in enumerate(rooms):
+        (z0, z1) = r["z_range"]
+        if (z >= z0 - z_margin) and (z <= z1 + z_margin) and r["poly"].contains(pt):
+            return rid
+    return None
+
+
+def filter_frame_by_2d_polygon(points_w, room_poly, eta=0.30):
+    if points_w.shape[0] == 0:
+        return False, 0.0
+    prep_poly = prep(room_poly)
+    xy = points_w[:, :2]
+    inside = polygon_contains_xy(prep_poly, xy)
+    frac = float(inside.mean())
+    return (frac >= eta), frac
+
+
+def cluster_poses_dbscan(pose_feats_7d, eps=0.8, min_samples=8):
+    scaler = StandardScaler()
+    X = scaler.fit_transform(pose_feats_7d)
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X)
+    return labels, X
+
+
+def medoid_indices(X_std, indices_in_room, labels):
+    keyframes = []
+    for lab in sorted(set(labels.tolist())):
+        if lab == -1:
+            continue
+        idxs = np.where(labels == lab)[0]
+        if idxs.size == 0:
+            continue
+        C = X_std[idxs]  # (m,7)
+        d = np.linalg.norm(C[:, None, :] - C[None, :, :], axis=2)
+        med_local = int(idxs[np.argmin(d.sum(axis=1))])
+        keyframes.append(int(indices_in_room[med_local]))
+    return keyframes
+
+
+# ---------------- TSDF utils (paper-aligned GT + per-frame TSDF voxels) ----------------
+def tsdf_reconstruct_pointcloud(
+    depth_paths, pose_paths, frame_indices,
+    fx, fy, cx, cy,
+    depth_scale=1000.0,
+    max_depth=4.0,
+    pose_is_w2c=False,
+    tsdf_voxel=0.02,
+    sdf_trunc=0.04,
+):
+    """Integrate TSDF over given frames and return extracted point cloud."""
+    if len(frame_indices) == 0:
+        return o3d.geometry.PointCloud()
+
+    d0 = imageio.imread(depth_paths[frame_indices[0]])
+    H, W = d0.shape[:2]
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(int(W), int(H), float(fx), float(fy), float(cx), float(cy))
+
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=float(tsdf_voxel),
+        sdf_trunc=float(sdf_trunc),
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor
+    )
+
+    color_dummy = np.zeros((H, W, 3), dtype=np.uint8)
+    color_o3d = o3d.geometry.Image(color_dummy)
+
+    for idx in frame_indices:
+        depth_raw = imageio.imread(depth_paths[idx]).astype(np.uint16)
+        depth_o3d = o3d.geometry.Image(depth_raw)
+
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color_o3d, depth_o3d,
+            depth_scale=float(depth_scale),
+            depth_trunc=float(max_depth),
+            convert_rgb_to_intensity=False
+        )
+
+        T_file = np.loadtxt(pose_paths[idx]).astype(np.float32)
+        # Open3D integrate expects extrinsic = w2c
+        if pose_is_w2c:
+            T_w2c = T_file
+        else:
+            T_w2c = np.linalg.inv(T_file)
+
+        volume.integrate(rgbd, intrinsic, T_w2c)
+
+    return volume.extract_point_cloud()
+
+
+def voxel_recall(V_rec: set, V_gt: set) -> float:
+    if len(V_gt) == 0:
+        return 0.0
+    inter = 0
+    if len(V_rec) < len(V_gt):
+        for x in V_rec:
+            if x in V_gt:
+                inter += 1
+    else:
+        for x in V_gt:
+            if x in V_rec:
+                inter += 1
+    return float(inter) / float(len(V_gt))
+
+
+def build_room_voxels_from_gt_points(points_gt, rooms, voxel_cov):
+    """Room-wise GT voxel sets using room bbox (fast & stable)."""
+    V_gt_room = {}
+    for rid, r in enumerate(rooms):
+        x0, y0, x1, y1 = r["bbox"]
+        xy = points_gt[:, :2]
+        in_bbox = (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+        pts = points_gt[in_bbox]
+        V_gt_room[rid] = voxelize_points(pts, voxel_cov)
+    return V_gt_room
+
+
+def greedy_select_by_voxels(candidate_frames, V_frame, V_gt, target_cov, min_gain_ratio, max_K):
+    """
+    candidate_frames: list[int]
+    V_frame: dict[int -> set]  each candidate's voxel set (already in GT coords)
+    """
+    selected = []
+    V_sel = set()
+    denom = float(len(V_gt)) if len(V_gt) > 0 else 1.0
+
+    # always pick best first
+    remaining = list(candidate_frames)
+
+    def current_cov():
+        return len(V_sel & V_gt) / denom
+
+    cov = current_cov()
+    while len(remaining) > 0 and len(selected) < max_K and cov < target_cov:
+        best = None
+        best_gain = -1
+        best_gain_ratio = 0.0
+
+        for f in remaining:
+            Vf = V_frame.get(f, set())
+            gain = len((V_sel | Vf) & V_gt) - len(V_sel & V_gt)
+            if gain <= 0:
+                continue
+            gain_ratio = gain / denom
+            if gain > best_gain:
+                best_gain = gain
+                best_gain_ratio = gain_ratio
+                best = f
+
+        if best is None:
+            break
+
+        if (len(selected) > 0) and (best_gain_ratio < min_gain_ratio):
+            break
+
+        selected.append(best)
+        V_sel |= V_frame.get(best, set())
+        remaining.remove(best)
+        cov = current_cov()
+        print(f"[KeySG] greedy add frame={best} gain={best_gain} gain_ratio={best_gain_ratio:.6f} cov={cov*100:.2f}%")
+
+    return selected, cov
+
+
+def main():
+    ap = argparse.ArgumentParser("KeySG-style keyframe sampling for ScanNet + paper-aligned TSDF GT + greedy coverage.")
+    ap.add_argument("--scene_dir", required=True)
+    ap.add_argument("--scene_id", default="")
+    ap.add_argument("--out", required=True)
+
+    # intrinsics
+    ap.add_argument("--use_intrinsic", choices=["auto", "depth", "color"], default="auto")
+    ap.add_argument("--depth_scale", type=float, default=1000.0)
+    ap.add_argument("--max_depth", type=float, default=4.0)
+    ap.add_argument("--sample_px", type=int, default=8)  # only used for eta check (backproject)
+    ap.add_argument("--candidate_stride", type=int, default=1)
+    ap.add_argument("--pose_is_w2c", action="store_true")
+
+    # room segmentation (on GT TSDF points)
+    ap.add_argument("--bev_res", type=float, default=0.10)
+    ap.add_argument("--floor_low", type=float, default=0.05)
+    ap.add_argument("--floor_high", type=float, default=0.20)
+
+    # 2D polygon filter
+    ap.add_argument("--eta", type=float, default=0.30)
+
+    # DBSCAN
+    ap.add_argument("--rot_w", type=float, default=1.0)
+    ap.add_argument("--db_eps", type=float, default=0.8)
+    ap.add_argument("--db_min_samples", type=int, default=8)
+
+    # GT TSDF (paper-aligned denominator)
+    ap.add_argument("--gt_tsdf_voxel", type=float, default=0.02)
+    ap.add_argument("--gt_sdf_trunc", type=float, default=0.04)
+
+    # candidate/rec TSDF for voxel sets (single frame TSDF)
+    ap.add_argument("--one_tsdf_voxel", type=float, default=0.04)
+    ap.add_argument("--one_sdf_trunc", type=float, default=0.08)
+
+    # coverage voxelization + greedy
+    ap.add_argument("--voxel_cov", type=float, default=0.10)
+    ap.add_argument("--target_cov", type=float, default=0.9626)
+    ap.add_argument("--min_gain_ratio", type=float, default=0.001)
+    ap.add_argument("--max_K", type=int, default=80)
+
+    # fallback for empty-room
+    ap.add_argument("--fallback_pool", type=int, default=30, help="max sampled frames per empty room for fallback")
+    ap.add_argument("--seed", type=int, default=2024)
+
+    args = ap.parse_args()
+    np.random.seed(args.seed)
+
+    scene_dir = args.scene_dir
+    scene_id = args.scene_id if args.scene_id else os.path.basename(scene_dir.rstrip("/"))
+
+    color_paths, depth_paths, pose_paths = list_scannet_files(scene_dir)
+    N = len(depth_paths)
+    cand = list(range(0, N, max(1, args.candidate_stride)))
+
+    print(f"[KeySG] scene={scene_id} frames_total={N} candidates={len(cand)}")
+
+    # choose intrinsics matching depth resolution
+    depth0 = imageio.imread(depth_paths[0])
+    H, W = depth0.shape[:2]
+    intrinsic_dir = os.path.join(scene_dir, "intrinsic")
+    intr_color = os.path.join(intrinsic_dir, "intrinsic_color.txt")
+    intr_depth = os.path.join(intrinsic_dir, "intrinsic_depth.txt")
+
+    if args.use_intrinsic == "depth":
+        chosen = intr_depth
+    elif args.use_intrinsic == "color":
+        chosen = intr_color
+    else:
+        best = None
+        for name, path in [("color", intr_color), ("depth", intr_depth)]:
+            if not os.path.isfile(path):
+                continue
+            fx_, fy_, cx_, cy_, _ = load_intrinsics_txt_4x4(path)
+            score = abs(cx_ - (W / 2.0)) + abs(cy_ - (H / 2.0))
+            if best is None or score < best[0]:
+                best = (score, name, path)
+        if best is None:
+            raise FileNotFoundError(f"No intrinsic txt found in {intrinsic_dir}")
+        chosen = best[2]
+
+    fx, fy, cx, cy, _ = load_intrinsics_txt_4x4(chosen)
+    print(f"[KeySG] depth resolution HxW={H}x{W}")
+    print(f"[KeySG] intrinsics: {chosen}")
+    print(f"[KeySG] fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
+
+    # ---------------- GT source = tsdf_full (paper-aligned) ----------------
+    print(f"[KeySG] GT source = tsdf_full (paper-aligned). Building TSDF from frames={N} stride={args.candidate_stride}")
+    gt_pcd = tsdf_reconstruct_pointcloud(
+        depth_paths=depth_paths,
+        pose_paths=pose_paths,
+        frame_indices=cand,
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        depth_scale=args.depth_scale,
+        max_depth=args.max_depth,
+        pose_is_w2c=args.pose_is_w2c,
+        tsdf_voxel=args.gt_tsdf_voxel,
+        sdf_trunc=args.gt_sdf_trunc,
+    )
+    gt_pts = np.asarray(gt_pcd.points).astype(np.float32)
+    print(f"[KeySG] tsdf_full points={gt_pts.shape[0]}")
+
+    V_gt = voxelize_points(gt_pts, args.voxel_cov)
+    print(f"[KeySG] V_gt_size = {len(V_gt)} at voxel={args.voxel_cov}m (gt_source=tsdf_full)")
+
+    # ---------------- rooms segmented ON GT points ----------------
+    rooms = segment_rooms_from_dense_cloud(
+        gt_pts,
+        bev_res=args.bev_res,
+        floor_band=(args.floor_low, args.floor_high),
+        smooth_sigma=1.0
+    )
+    print(f"[KeySG] rooms segmented: {len(rooms)} (bev_res={args.bev_res})")
+
+    V_gt_room = build_room_voxels_from_gt_points(gt_pts, rooms, args.voxel_cov)
+
+    # ---------------- Step A: assign + eta filter ----------------
+    room_frames = {rid: [] for rid in range(len(rooms))}
+    room_posefeats = {rid: [] for rid in range(len(rooms))}
+    kept_total = 0
+
+    for idx in tqdm(cand, desc="Assign+filter frames"):
+        T = load_pose_4x4(pose_paths[idx], pose_is_w2c=args.pose_is_w2c)
+        cam_center = T[:3, 3]
+        rid = assign_room_by_volumetric(cam_center, rooms)
+        if rid is None:
+            continue
+
+        pts_w = backproject_depth_to_world(
+            depth_paths[idx], T,
+            fx, fy, cx, cy,
+            depth_scale=args.depth_scale,
+            max_depth=args.max_depth,
+            sample_px=args.sample_px
+        )
+
+        keep, _frac = filter_frame_by_2d_polygon(pts_w, rooms[rid]["poly"], eta=args.eta)
+        if not keep:
+            continue
+
+        R = T[:3, :3]
+        t = cam_center.astype(np.float32)
+        q = rot_to_quat_wxyz(R).astype(np.float32)
+        feat = np.concatenate([t, args.rot_w * q], axis=0)  # 7D
+
+        room_frames[rid].append(int(idx))
+        room_posefeats[rid].append(feat)
+        kept_total += 1
+
+    print(f"[KeySG] frames kept after room+eta filter = {kept_total}")
+
+    # ---------------- Step B: DBSCAN + medoid per room -> candidate set ----------------
+    candidate_frames = []
+    per_room_stats = {}
+
+    for rid in range(len(rooms)):
+        idxs = room_frames[rid]
+        if len(idxs) == 0:
+            per_room_stats[rid] = {"kept": 0, "clusters": 0, "noise": 0, "keyframes": 0}
+            continue
+
+        F = np.stack(room_posefeats[rid], axis=0)  # (M,7)
+        labels, X_std = cluster_poses_dbscan(F, eps=args.db_eps, min_samples=args.db_min_samples)
+        kf_r = medoid_indices(X_std, idxs, labels)
+
+        clusters = len(set(labels.tolist())) - (1 if (-1 in labels) else 0)
+        noise = int(np.sum(labels == -1))
+        per_room_stats[rid] = {"kept": len(idxs), "clusters": clusters, "noise": noise, "keyframes": len(kf_r)}
+
+        candidate_frames.extend(kf_r)
+
+    candidate_frames = sorted(list(set(map(int, candidate_frames))))
+    print(f"[KeySG] candidate keyframes (room+dbscan+medoid) = {len(candidate_frames)}")
+    print(f"[KeySG] per-room stats = {per_room_stats}")
+    print(f"[KeySG] candidate_indices (first 30) = {candidate_frames[:30]}")
+
+    # ---------------- Step B.5: room fallback (CRITICAL FIX) ----------------
+    # If a room has GT voxels but produced 0 candidates, pick a best frame from its kept frames (sampled)
+    fallback_added = []
+    for rid in range(len(rooms)):
+        if len(V_gt_room[rid]) == 0:
+            continue  # room has no gt voxels -> ignore
+        # room already has candidates?
+        has_candidate = False
+        for f in candidate_frames:
+            # a candidate belongs to room if it's in room_frames[rid] (medoid chosen from there)
+            if f in set(room_frames[rid]):
+                has_candidate = True
+                break
+        if has_candidate:
+            continue
+
+        kept = room_frames[rid]
+        if len(kept) == 0:
+            continue
+
+        # sample up to fallback_pool frames uniformly
+        if len(kept) <= args.fallback_pool:
+            sample = kept
+        else:
+            sample_idx = np.linspace(0, len(kept) - 1, args.fallback_pool).astype(int)
+            sample = [kept[i] for i in sample_idx]
+
+        best_f = None
+        best_inter = -1
+
+        for f in sample:
+            one_pcd = tsdf_reconstruct_pointcloud(
+                depth_paths=depth_paths,
+                pose_paths=pose_paths,
+                frame_indices=[f],
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                depth_scale=args.depth_scale,
+                max_depth=args.max_depth,
+                pose_is_w2c=args.pose_is_w2c,
+                tsdf_voxel=args.one_tsdf_voxel,
+                sdf_trunc=args.one_sdf_trunc,
+            )
+            pts = np.asarray(one_pcd.points).astype(np.float32)
+            V_one = voxelize_points(pts, args.voxel_cov)
+            inter = len(V_one & V_gt_room[rid])
+            if inter > best_inter:
+                best_inter = inter
+                best_f = f
+
+        if best_f is not None:
+            candidate_frames.append(int(best_f))
+            fallback_added.append(int(best_f))
+            print(f"[KeySG] fallback add room={rid} best_frame={best_f} inter_room_gt={best_inter}")
+
+    candidate_frames = sorted(list(set(candidate_frames)))
+    if len(fallback_added) > 0:
+        print(f"[KeySG] fallback added frames = {sorted(fallback_added)}")
+        print(f"[KeySG] candidate keyframes AFTER fallback = {len(candidate_frames)}")
+
+    # ---------------- Step C: build per-candidate voxel sets using single-frame TSDF ----------------
+    V_frame = {}
+    print("Candidate voxel sets (single-frame TSDF):")
+    for f in tqdm(candidate_frames, desc="Candidate voxel sets (single-frame TSDF)"):
+        one_pcd = tsdf_reconstruct_pointcloud(
+            depth_paths=depth_paths,
+            pose_paths=pose_paths,
+            frame_indices=[f],
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            depth_scale=args.depth_scale,
+            max_depth=args.max_depth,
+            pose_is_w2c=args.pose_is_w2c,
+            tsdf_voxel=args.one_tsdf_voxel,
+            sdf_trunc=args.one_sdf_trunc,
+        )
+        pts = np.asarray(one_pcd.points).astype(np.float32)
+        V_one = voxelize_points(pts, args.voxel_cov)
+        V_frame[int(f)] = V_one
+        # debug first few
+        if f in candidate_frames[:6]:
+            print(f"[KeySG] cand frame={f} oneTSDF_pts={pts.shape[0]} V_one={len(V_one)}")
+
+    # ---------------- Step D: greedy to reach target coverage ----------------
+    selected, cov = greedy_select_by_voxels(
+        candidate_frames=candidate_frames,
+        V_frame=V_frame,
+        V_gt=V_gt,
+        target_cov=args.target_cov,
+        min_gain_ratio=args.min_gain_ratio,
+        max_K=args.max_K
+    )
+    print(f"[KeySG] FINAL selected keyframes = {len(selected)} achieved_cov={cov*100:.2f}%")
+
+    # ---------------- Per-room coverage print (DIAGNOSTIC) ----------------
+    # approximate per-room rec voxels as union of selected candidates' single-frame TSDF voxels
+    V_sel = set()
+    for f in selected:
+        V_sel |= V_frame.get(int(f), set())
+
+    per_room_cov = {}
+    for rid in range(len(rooms)):
+        Vg = V_gt_room[rid]
+        if len(Vg) == 0:
+            per_room_cov[rid] = {"V_gt": 0, "V_rec": 0, "cov": 0.0}
+            continue
+        Vr = V_sel  # global selected voxels
+        cov_r = voxel_recall(Vr, Vg)
+        per_room_cov[rid] = {"V_gt": int(len(Vg)), "V_rec": int(len(Vr)), "cov": float(cov_r)}
+
+    print(f"[KeySG] per-room coverage (voxel recall wrt room-gt) = {per_room_cov}")
+
+    out = {
+        "scene_id": scene_id,
+        "method": "keysg_room_dbscan_medoid_tsdfGT_greedy_fallback",
+        "frames_total": int(N),
+        "candidate_stride": int(args.candidate_stride),
+        "intrinsic_path": chosen,
+        "depth_shape_hw": [int(H), int(W)],
+
+        "depth_scale": float(args.depth_scale),
+        "max_depth": float(args.max_depth),
+        "sample_px": int(args.sample_px),
+
+        "gt_tsdf": {"voxel": float(args.gt_tsdf_voxel), "sdf_trunc": float(args.gt_sdf_trunc)},
+        "one_tsdf": {"voxel": float(args.one_tsdf_voxel), "sdf_trunc": float(args.one_sdf_trunc)},
+        "coverage": {
+            "voxel_cov": float(args.voxel_cov),
+            "target_cov": float(args.target_cov),
+            "min_gain_ratio": float(args.min_gain_ratio),
+            "achieved_cov": float(cov),
+            "V_gt_size": int(len(V_gt)),
+        },
+        "room_seg": {
+            "bev_res": float(args.bev_res),
+            "floor_band": [float(args.floor_low), float(args.floor_high)],
+            "num_rooms": int(len(rooms)),
+            "eta": float(args.eta),
+        },
+        "dbscan": {
+            "rot_w": float(args.rot_w),
+            "eps": float(args.db_eps),
+            "min_samples": int(args.db_min_samples),
+        },
+        "stats": {
+            "kept_total": int(kept_total),
+            "per_room": per_room_stats,
+            "per_room_coverage": per_room_cov,
+            "fallback_added": sorted(fallback_added),
+            "candidate_count": int(len(candidate_frames)),
+        },
+        "keyframe_indices": selected,
+        "candidate_indices": candidate_frames,
+    }
+
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(out, f, indent=2)
+
+    print(f"[KeySG] Saved: {args.out}")
+
+
+if __name__ == "__main__":
+    main()
