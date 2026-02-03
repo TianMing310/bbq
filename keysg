@@ -47,7 +47,7 @@ def load_pose_4x4(path, pose_is_w2c=False):
 
 
 def rot_to_quat_wxyz(R):
-    """Robust quaternion (w,x,y,z) from rotation matrix."""
+    """Robust quaternion (w,x,y,z) from rotation matrix. Canonicalize sign to avoid q/-q ambiguity."""
     m = R
     t = np.trace(m)
     if t > 0.0:
@@ -75,9 +75,15 @@ def rot_to_quat_wxyz(R):
             x = (m[0, 2] + m[2, 0]) / s
             y = (m[1, 2] + m[2, 1]) / s
             z = 0.25 * s
+
     q = np.array([w, x, y, z], dtype=np.float32)
     n = np.linalg.norm(q) + 1e-12
-    return q / n
+    q = q / n
+
+    # Canonicalize sign: q and -q represent same rotation; enforce w >= 0 for stability.
+    if q[0] < 0:
+        q = -q
+    return q
 
 
 # ---------------- geometry helpers ----------------
@@ -264,10 +270,15 @@ def frac_in_bbox_xy(points_w, bbox):
     return float(inside.mean())
 
 
-def assign_room(camera_center, pts_w, rooms, eta_assign=0.12, z_margin=0.10):
+def assign_room(camera_center, pts_w, rooms, eta_assign=0.12, z_margin=0.10, min_best_frac=0.01):
     """
-    1) try camera center inside bbox & z range
-    2) fallback: choose room with max frac(pts in bbox) if >= eta_assign
+    Return (rid, best_frac).
+
+    Strategy:
+    1) try camera center inside bbox & z range -> return that rid quickly (best_frac computed too)
+    2) fallback: choose room with max frac(pts in bbox). If best_frac < min_best_frac -> None.
+       NOTE: do NOT require best_frac >= eta_assign to assign; eta_assign is only used as "strong confidence"
+             but we still assign to best room to avoid empty rooms.
     """
     x, y, z = float(camera_center[0]), float(camera_center[1]), float(camera_center[2])
 
@@ -277,7 +288,9 @@ def assign_room(camera_center, pts_w, rooms, eta_assign=0.12, z_margin=0.10):
         if (z >= z0 - z_margin) and (z <= z1 + z_margin):
             x0, y0, x1, y1 = r["bbox"]
             if (x >= x0) and (x <= x1) and (y >= y0) and (y <= y1):
-                return rid
+                # compute frac for logging/soft pool
+                frac = frac_in_bbox_xy(pts_w, r["bbox"])
+                return rid, frac
 
     # pass2: by points overlap
     best_rid, best_frac = None, 0.0
@@ -287,14 +300,14 @@ def assign_room(camera_center, pts_w, rooms, eta_assign=0.12, z_margin=0.10):
             best_frac = frac
             best_rid = rid
 
-    if best_rid is not None and best_frac >= float(eta_assign):
-        return best_rid
-    return None
+    if best_rid is None or best_frac < float(min_best_frac):
+        return None, 0.0
+
+    return best_rid, float(best_frac)
 
 
-def keep_frame_in_room(pts_w, room_bbox, eta=0.30):
-    frac = frac_in_bbox_xy(pts_w, room_bbox)
-    return (frac >= float(eta)), frac
+def keep_frame_in_room_frac(frac, eta=0.30):
+    return (float(frac) >= float(eta))
 
 
 # ---------------- clustering ----------------
@@ -454,19 +467,21 @@ def pick_topk_by_voxelsize(
 
 
 # ---------------- greedy selection ----------------
-def greedy_select(candidate_frames, V_frame_map, V_gt, target_cov=0.85, max_K=80, min_gain_ratio=0.001, verbose=True):
+def greedy_select(candidate_frames, V_frame_map, V_gt,
+                  target_cov=0.85, max_K=80, min_gain_ratio=0.001, verbose=True):
     selected = []
-    V_sel = set()
+    V_sel_gt = set()   # 只维护 GT 覆盖集合
     cov = 0.0
     V_gt_size = max(1, len(V_gt))
 
     remaining = set(candidate_frames)
 
-    while len(remaining) > 0 and len(selected) < int(max_K) and cov < float(target_cov):
+    while remaining and len(selected) < int(max_K) and cov < float(target_cov):
         best_f, best_gain = None, -1
+
         for f in remaining:
             V = V_frame_map[f]
-            gain = len(V - V_sel)
+            gain = len((V & V_gt) - V_sel_gt)   # ✅ GT-aware gain
             if gain > best_gain:
                 best_gain = gain
                 best_f = f
@@ -479,16 +494,16 @@ def greedy_select(candidate_frames, V_frame_map, V_gt, target_cov=0.85, max_K=80
             break
 
         selected.append(int(best_f))
-        V_sel |= V_frame_map[best_f]
-        cov = len(V_sel & V_gt) / float(V_gt_size)
+        V_sel_gt |= (V_frame_map[best_f] & V_gt)   # ✅ 只加 GT 部分
+        cov = len(V_sel_gt) / float(V_gt_size)
 
         remaining.remove(best_f)
 
         if verbose:
-            print(f"[KeySG] greedy add frame={best_f} gain={best_gain} gain_ratio={gain_ratio:.6f} cov={cov*100:.2f}%")
+            print(f"[KeySG] greedy add frame={best_f} gain_gt={best_gain} "
+                  f"gain_ratio={gain_ratio:.6f} cov={cov*100:.2f}%")
 
-    return selected, cov, V_sel
-
+    return selected, cov, V_sel_gt
 
 def main():
     ap = argparse.ArgumentParser("KeySG-style keyframe sampling + (paper-aligned) coverage. Backproj voxels to avoid TSDF mismatch.")
@@ -504,7 +519,7 @@ def main():
     # depth -> points
     ap.add_argument("--depth_scale", type=float, default=1000.0)
     ap.add_argument("--max_depth", type=float, default=4.0)
-    ap.add_argument("--sample_px", type=int, default=4)            # default adopt friend's idea: denser
+    ap.add_argument("--sample_px", type=int, default=4)
     ap.add_argument("--candidate_stride", type=int, default=1)
 
     # metric / coverage
@@ -524,12 +539,21 @@ def main():
 
     # room & filtering
     ap.add_argument("--eta", type=float, default=0.30, help="keep frame if frac(pts in room) >= eta")
-    ap.add_argument("--eta_assign", type=float, default=0.12, help="fallback assignment if best room frac >= eta_assign")
+    ap.add_argument("--eta_assign", type=float, default=0.12, help="(legacy) fallback assignment confidence threshold")
+    ap.add_argument("--min_best_frac", type=float, default=0.01, help="if best room frac < this, treat as unassigned")
 
-    # DBSCAN (defaults adopt friend's direction: more clusters)
+    # NEW: room keep safety net (prevents kept=0 rooms)
+    ap.add_argument("--min_frames_per_room", type=int, default=30,
+                    help="if a room kept frames < this, top-up from soft pool by frac")
+    ap.add_argument("--soft_min_frac", type=float, default=0.03,
+                    help="store frame into soft pool if best room frac >= this (even if < eta)")
+
+    # DBSCAN
     ap.add_argument("--db_eps", type=float, default=0.25)
     ap.add_argument("--db_min_samples", type=int, default=2)
     ap.add_argument("--rot_w", type=float, default=3.0)
+    ap.add_argument("--cluster_topk", type=int, default=1,
+                help="per DBSCAN cluster: keep medoid + (topk-1) extra frames by voxel size")
 
     # noise / fallback fixes
     ap.add_argument("--noise_topk", type=int, default=8, help="add top-k noise frames per room back into candidates")
@@ -585,7 +609,6 @@ def main():
 
     # ---- build GT pointcloud/voxels ----
     floor_band_abs = None
-    # floor band is absolute based on estimated floor z from GT pointcloud
     if args.gt_source == "tsdf_full":
         print(f"[KeySG] GT source = tsdf_full. Building TSDF from frames={N} stride=1")
         gt_pcd = tsdf_full_reconstruct(
@@ -603,7 +626,6 @@ def main():
         floor_z = estimate_floor_z(gt_pts)
         floor_band_abs = (floor_z - float(args.floor_low), floor_z + float(args.floor_high))
     else:
-        # raw_union still needs a floor estimate for bev rooms; get a cheap floor estimate from a sparse sample of frames
         sample_for_floor = list(range(0, N, max(1, N // 50)))
         pts_acc = []
         for idx in sample_for_floor:
@@ -624,7 +646,6 @@ def main():
     if args.gt_source == "tsdf_full":
         rooms = segment_rooms_from_cloud(gt_pts, bev_res=args.bev_res, floor_band_abs=floor_band_abs, smooth_sigma=1.0)
     else:
-        # for raw_union, build a pseudo cloud for room segmentation using the floor estimate sample
         rooms = segment_rooms_from_cloud(gt_pts_floor, bev_res=args.bev_res, floor_band_abs=floor_band_abs, smooth_sigma=1.0)
 
     print(f"[KeySG] rooms segmented: {len(rooms)} (bev_res={args.bev_res})")
@@ -659,6 +680,9 @@ def main():
     # ---- Step A: assign + filter frames into rooms ----
     room_frames = {rid: [] for rid in range(len(rooms))}
     room_posefeats = {rid: [] for rid in range(len(rooms))}
+    # NEW: soft pool keeps "almost in room" frames by best_frac, used to top up empty/small rooms
+    room_soft = {rid: [] for rid in range(len(rooms))}  # list of (frac, idx, feat)
+
     kept_total = 0
 
     for idx in tqdm(cand_all, desc="Assign+filter frames"):
@@ -673,12 +697,12 @@ def main():
             sample_px=args.sample_px
         )
 
-        rid = assign_room(cam_center, pts_w, rooms, eta_assign=args.eta_assign)
+        rid, best_frac = assign_room(
+            cam_center, pts_w, rooms,
+            eta_assign=args.eta_assign,
+            min_best_frac=args.min_best_frac
+        )
         if rid is None:
-            continue
-
-        keep, _frac = keep_frame_in_room(pts_w, rooms[rid]["bbox"], eta=args.eta)
-        if not keep:
             continue
 
         R = T[:3, :3]
@@ -686,13 +710,50 @@ def main():
         q = rot_to_quat_wxyz(R).astype(np.float32)
         feat = np.concatenate([t, args.rot_w * q], axis=0)
 
+        # record soft candidates
+        if best_frac >= float(args.soft_min_frac):
+            room_soft[rid].append((float(best_frac), int(idx), feat))
+
+        # hard keep by eta
+        if not keep_frame_in_room_frac(best_frac, eta=args.eta):
+            continue
+
         room_frames[rid].append(int(idx))
         room_posefeats[rid].append(feat)
         kept_total += 1
 
-    print(f"[KeySG] frames kept after room+eta filter = {kept_total}")
+    # NEW: top-up rooms with too few kept frames
+    for rid in range(len(rooms)):
+        if len(room_frames[rid]) >= int(args.min_frames_per_room):
+            continue
+        if len(room_soft[rid]) == 0:
+            continue
 
-    # ---- Step B: DBSCAN + medoid + (IMPORTANT) keep noise topK + fallback for empty-cluster rooms ----
+        needed = int(args.min_frames_per_room) - len(room_frames[rid])
+        if needed <= 0:
+            continue
+
+        # sort by frac desc
+        room_soft[rid].sort(key=lambda x: x[0], reverse=True)
+        added = 0
+        existing = set(room_frames[rid])
+
+        for frac, fidx, feat in room_soft[rid]:
+            if fidx in existing:
+                continue
+            room_frames[rid].append(int(fidx))
+            room_posefeats[rid].append(feat)
+            existing.add(fidx)
+            added += 1
+            if added >= needed:
+                break
+
+    kept_total_after = sum(len(room_frames[rid]) for rid in range(len(rooms)))
+    print(f"[KeySG] frames kept after room+eta filter = {kept_total} (hard eta)")
+    if kept_total_after != kept_total:
+        print(f"[KeySG] frames kept after room top-up = {kept_total_after} (min_frames_per_room={args.min_frames_per_room}, soft_min_frac={args.soft_min_frac})")
+
+    # ---- Step B: DBSCAN + medoid + keep noise topK + fallback for empty-cluster rooms ----
     candidate = []
     per_room = {}
 
@@ -711,11 +772,39 @@ def main():
         # medoids for real clusters
         kf_r = medoid_indices(X_std, idxs, labels)
 
+        # ---- NEW: keep extra frames per cluster (not only 1 medoid) ----
+        if args.cluster_topk > 1:
+            labs = sorted(set(labels.tolist()))
+            for lab in labs:
+                if lab == -1:
+                    continue
+                local_members = np.where(labels == lab)[0]
+                if local_members.size <= 1:
+                    continue
+
+                member_frames = [int(idxs[i]) for i in local_members.tolist()]
+
+                # exclude already chosen medoid (optional)
+                # we just pick topk-1 and union, duplicates are fine then set() later
+                extra = pick_topk_by_voxelsize(
+                    member_frames, depth_paths, pose_paths,
+                    fx, fy, cx, cy,
+                    args.depth_scale, args.max_depth, args.sample_px,
+                    args.pose_is_w2c,
+                    metric=args.metric,
+                    voxel_cov=args.voxel_cov,
+                    bev_res=args.bev_res,
+                    floor_band_abs=floor_band_abs,
+                    room_bbox=rooms[rid]["bbox"],
+                    topk=min(args.cluster_topk - 1, len(member_frames))
+                )
+                kf_r = list(set(kf_r + extra))
+
         # noise indices
         noise_local = np.where(labels == -1)[0]
         noise_idxs = [int(idxs[i]) for i in noise_local.tolist()]
 
-        # fallback: if no clusters (your room2 case), do NOT lose this room
+        # fallback: if no clusters, do NOT lose this room
         if num_clusters == 0:
             kf_r = pick_topk_by_voxelsize(
                 idxs, depth_paths, pose_paths,
@@ -761,7 +850,7 @@ def main():
     print(f"[KeySG] per-room stats = {per_room}")
     print(f"[KeySG] candidate_indices (first 30) = {candidate[:30]}")
 
-    # ---- Candidate voxel sets (CRITICAL FIX: use backprojection, not single-frame TSDF) ----
+    # ---- Candidate voxel sets ----
     V_frame_map = {}
     print("[KeySG] Candidate voxel sets (from backprojection):")
     for f in tqdm(candidate, desc="Candidate voxel sets"):
@@ -815,6 +904,9 @@ def main():
             "num_rooms": int(len(rooms)),
             "eta": float(args.eta),
             "eta_assign": float(args.eta_assign),
+            "min_best_frac": float(args.min_best_frac),
+            "min_frames_per_room": int(args.min_frames_per_room),
+            "soft_min_frac": float(args.soft_min_frac),
         },
         "dbscan": {
             "rot_w": float(args.rot_w),
